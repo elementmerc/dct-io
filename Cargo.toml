@@ -1,0 +1,17 @@
+[package]
+name = "dct-io"
+version = "0.1.0"
+edition = "2021"
+description = "Read and write quantized DCT coefficients in baseline JPEG files"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/elementmerc/dct-io"
+documentation = "https://docs.rs/dct-io"
+keywords = ["jpeg", "dct", "image", "codec"]
+categories = ["multimedia::images", "encoding", "parser-implementations"]
+readme = "README.md"
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
