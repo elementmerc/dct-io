@@ -94,6 +94,33 @@ pub enum DctError {
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// Metadata for a single image component, as read from the SOF marker.
+#[derive(Debug, Clone)]
+pub struct ComponentInfo {
+    /// Component identifier (1=Y, 2=Cb, 3=Cr in YCbCr; 1=Y in grayscale).
+    pub id: u8,
+    /// Horizontal sampling factor.
+    pub h_samp: u8,
+    /// Vertical sampling factor.
+    pub v_samp: u8,
+    /// Number of 8×8 DCT blocks this component contributes to the image.
+    pub block_count: usize,
+}
+
+/// Image metadata extracted from a JPEG without decoding the entropy stream.
+///
+/// Obtained from [`inspect`]. Cheaper than [`read_coefficients`] when you
+/// only need dimensions, component count, or block counts.
+#[derive(Debug, Clone)]
+pub struct JpegInfo {
+    /// Image width in pixels.
+    pub width: u16,
+    /// Image height in pixels.
+    pub height: u16,
+    /// Per-component metadata, in SOF order (typically Y, Cb, Cr).
+    pub components: Vec<ComponentInfo>,
+}
+
 /// Quantized DCT coefficients for a single component (Y, Cb, or Cr).
 ///
 /// Each element of `blocks` is one 8×8 DCT block, stored in the JPEG zigzag
@@ -176,6 +203,76 @@ pub fn block_count(jpeg: &[u8]) -> Result<Vec<usize>, DctError> {
     Ok(parser.block_counts())
 }
 
+/// Inspect a JPEG and return image metadata without decoding the entropy stream.
+///
+/// Much cheaper than [`read_coefficients`] when you only need the image
+/// dimensions, component layout, or block counts.
+///
+/// # Errors
+///
+/// Returns [`DctError`] if the input is not a supported baseline JPEG.
+pub fn inspect(jpeg: &[u8]) -> Result<JpegInfo, DctError> {
+    let mut parser = JpegParser::new(jpeg)?;
+    parser.parse()?;
+    let counts = parser.block_counts();
+    Ok(JpegInfo {
+        width: parser.image_width,
+        height: parser.image_height,
+        components: parser
+            .frame_components
+            .iter()
+            .enumerate()
+            .map(|(i, fc)| ComponentInfo {
+                id: fc.id,
+                h_samp: fc.h_samp,
+                v_samp: fc.v_samp,
+                block_count: counts[i],
+            })
+            .collect(),
+    })
+}
+
+/// Count the number of AC coefficients with `|v| >= 2` across all components.
+///
+/// These are the coefficients that can be modified without altering zero-run
+/// lengths or EOB positions — the eligible positions for JSteg-style LSB
+/// embedding. Decodes all coefficients internally; use
+/// [`JpegCoefficients::eligible_ac_count`] to avoid decoding twice.
+///
+/// # Errors
+///
+/// Returns [`DctError`] if the input is not a supported baseline JPEG.
+pub fn eligible_ac_count(jpeg: &[u8]) -> Result<usize, DctError> {
+    Ok(read_coefficients(jpeg)?.eligible_ac_count())
+}
+
+impl JpegCoefficients {
+    /// Count the number of AC coefficients with `|v| >= 2` across all
+    /// components.
+    ///
+    /// Modifying only these coefficients preserves the zero-run structure of
+    /// the entropy stream, keeping the output a valid JPEG that is
+    /// perceptually indistinguishable from the original.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use dct_io::read_coefficients;
+    ///
+    /// let jpeg = std::fs::read("photo.jpg").unwrap();
+    /// let coeffs = read_coefficients(&jpeg).unwrap();
+    /// println!("Eligible AC positions: {}", coeffs.eligible_ac_count());
+    /// ```
+    pub fn eligible_ac_count(&self) -> usize {
+        self.components
+            .iter()
+            .flat_map(|c| c.blocks.iter())
+            .flat_map(|b| b[1..].iter())
+            .filter(|&&v| v.abs() >= 2)
+            .count()
+    }
+}
+
 // ── Internal constants ────────────────────────────────────────────────────────
 
 /// Zigzag scan order: maps coefficient index (0..64) to (row, col) in an 8×8
@@ -231,14 +328,25 @@ fn encode_value(value: i16) -> (u8, u16, u8) {
 // ── Huffman table ─────────────────────────────────────────────────────────────
 
 /// A single Huffman table (DC or AC, for one component class).
-#[derive(Debug, Clone)]
+///
+/// Decoding uses a flat 65 536-entry lookup table indexed by the top 16 bits
+/// of the bit-stream. Each entry packs `(symbol << 8) | code_len` as a `u16`,
+/// with 0 meaning "no code with this prefix". This gives O(1) decode with no
+/// hash collision and better cache locality than the HashMap approach.
+#[derive(Clone)]
 struct HuffTable {
-    /// Decode map: `canonical_code -> (symbol, code_length)`.
-    decode: HashMap<u16, (u8, u8)>,
-    /// Encode map: `symbol -> (code, code_length)`.
+    /// 16-bit LUT: index = top 16 stream bits → `(symbol << 8) | len`, 0 = invalid.
+    lut: Vec<u16>,
+    /// Encode map: `symbol → (code, code_length)`.
     encode: HashMap<u8, (u16, u8)>,
-    /// Length of the longest code (for decode loop bound).
-    max_len: u8,
+}
+
+impl std::fmt::Debug for HuffTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HuffTable")
+            .field("encode_entries", &self.encode.len())
+            .finish()
+    }
 }
 
 impl HuffTable {
@@ -247,11 +355,10 @@ impl HuffTable {
     /// `counts` is the 16-byte array of code counts per length (1..=16).
     /// `symbols` is the flat list of symbols in canonical order.
     fn from_jpeg(counts: &[u8; 16], symbols: &[u8]) -> Result<Self, DctError> {
-        let mut decode = HashMap::new();
         let mut encode = HashMap::new();
+        let mut lut = vec![0u16; 65536];
         let mut code: u16 = 0;
         let mut sym_idx = 0usize;
-        let mut max_len = 0u8;
 
         for len in 1u8..=16u8 {
             let count = counts[(len - 1) as usize] as usize;
@@ -261,15 +368,22 @@ impl HuffTable {
                 }
                 let sym = symbols[sym_idx];
                 sym_idx += 1;
-                decode.insert(code, (sym, len));
                 encode.insert(sym, (code, len));
-                max_len = len;
+
+                // Fill all 16-bit keys whose top `len` bits equal `code`.
+                // Each such key represents a stream where the Huffman prefix
+                // is followed by arbitrary suffix bits.
+                let spread = 1usize << (16 - len);
+                let base = (code as usize) << (16 - len);
+                let entry = ((sym as u16) << 8) | (len as u16);
+                lut[base..base + spread].fill(entry);
+
                 code += 1;
             }
             code <<= 1;
         }
 
-        Ok(HuffTable { decode, encode, max_len })
+        Ok(HuffTable { lut, encode })
     }
 }
 
@@ -345,20 +459,37 @@ impl<'a> BitReader<'a> {
         Ok(v)
     }
 
-    /// Decode the next Huffman symbol.
+    /// Decode the next Huffman symbol using the 16-bit LUT.
+    ///
+    /// Forms a 16-bit key from the top bits of the buffer (right-padded with
+    /// zeros if fewer than 16 bits are available). The LUT maps this key
+    /// directly to `(symbol, code_length)` in a single indexed read.
     fn decode_huffman(&mut self, table: &HuffTable) -> Result<u8, DctError> {
-        for len in 1..=table.max_len {
-            let candidate = self.peek(len)?;
-            // Must check code_len == len: canonical codes at different lengths
-            // can share the same numeric value in the HashMap.
-            if let Some(&(sym, code_len)) = table.decode.get(&candidate) {
-                if code_len == len {
-                    self.consume(len);
-                    return Ok(sym);
-                }
-            }
+        if self.bits < 16 {
+            self.refill();
         }
-        Err(DctError::CorruptEntropy)
+        // Build the 16-bit key: top `min(bits, 16)` stream bits left-aligned.
+        let key = if self.bits >= 16 {
+            ((self.buf >> (self.bits - 16)) & 0xFFFF) as u16
+        } else {
+            // Fewer than 16 bits available — pad the right with zeros.
+            // The LUT entry for any short code covers all possible suffixes,
+            // so zero-padding is safe as long as len <= self.bits.
+            ((self.buf << (16 - self.bits)) & 0xFFFF) as u16
+        };
+
+        let entry = table.lut[key as usize];
+        let len = (entry & 0xFF) as u8;
+        let sym = (entry >> 8) as u8;
+
+        if len == 0 {
+            return Err(DctError::CorruptEntropy);
+        }
+        if self.bits < len {
+            return Err(DctError::Truncated);
+        }
+        self.consume(len);
+        Ok(sym)
     }
 
     /// Skip any restart marker at the current position and reset DC predictor.
@@ -1226,5 +1357,96 @@ mod tests {
         // Check SOI and EOI markers.
         assert_eq!(&out[..2], &[0xFF, 0xD8], "missing SOI");
         assert_eq!(&out[out.len() - 2..], &[0xFF, 0xD9], "missing EOI");
+    }
+
+    // ── inspect() tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn inspect_gray_returns_correct_dimensions() {
+        let jpeg = make_jpeg_gray(32, 16);
+        let info = inspect(&jpeg).unwrap();
+        assert_eq!(info.width, 32);
+        assert_eq!(info.height, 16);
+        assert_eq!(info.components.len(), 1);
+        assert_eq!(info.components[0].block_count, 8); // 4×2 blocks
+    }
+
+    #[test]
+    fn inspect_rgb_returns_three_components() {
+        let jpeg = make_jpeg_rgb(32, 32);
+        let info = inspect(&jpeg).unwrap();
+        assert_eq!(info.width, 32);
+        assert_eq!(info.height, 32);
+        assert_eq!(info.components.len(), 3);
+        // Total blocks across components must be positive.
+        let total: usize = info.components.iter().map(|c| c.block_count).sum();
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn inspect_matches_block_count() {
+        let jpeg = make_jpeg_rgb(48, 32);
+        let info = inspect(&jpeg).unwrap();
+        let counts = block_count(&jpeg).unwrap();
+        let info_counts: Vec<usize> = info.components.iter().map(|c| c.block_count).collect();
+        assert_eq!(info_counts, counts);
+    }
+
+    // ── eligible_ac_count tests ───────────────────────────────────────────────
+
+    #[test]
+    fn eligible_ac_count_is_positive() {
+        let jpeg = make_jpeg_rgb(32, 32);
+        let n = eligible_ac_count(&jpeg).unwrap();
+        assert!(n > 0, "natural image should have eligible AC coefficients");
+    }
+
+    #[test]
+    fn eligible_ac_count_method_matches_free_fn() {
+        let jpeg = make_jpeg_gray(32, 32);
+        let coeffs = read_coefficients(&jpeg).unwrap();
+        let via_method = coeffs.eligible_ac_count();
+        let via_fn = eligible_ac_count(&jpeg).unwrap();
+        assert_eq!(via_method, via_fn);
+    }
+
+    #[test]
+    fn eligible_ac_count_leq_total_ac_count() {
+        let jpeg = make_jpeg_rgb(32, 32);
+        let coeffs = read_coefficients(&jpeg).unwrap();
+        let eligible = coeffs.eligible_ac_count();
+        let total_ac: usize = coeffs.components.iter()
+            .flat_map(|c| c.blocks.iter())
+            .map(|_| 63) // 63 AC coefficients per block
+            .sum();
+        assert!(eligible <= total_ac);
+    }
+
+    // ── LUT Huffman decode correctness (regression for the old HashMap version) ─
+
+    #[test]
+    fn lut_decode_matches_modification_roundtrip() {
+        // A natural image exercises many different Huffman code lengths.
+        // If the LUT decode is wrong, the modification roundtrip will fail.
+        let jpeg = make_jpeg_rgb(64, 64);
+        let mut coeffs = read_coefficients(&jpeg).unwrap();
+        let mut flipped = 0usize;
+        for comp in &mut coeffs.components {
+            for block in &mut comp.blocks {
+                for coeff in block[1..].iter_mut() {
+                    if coeff.abs() >= 2 {
+                        *coeff ^= 1;
+                        flipped += 1;
+                    }
+                }
+            }
+        }
+        assert!(flipped > 0);
+        let modified = write_coefficients(&jpeg, &coeffs).unwrap();
+        let coeffs2 = read_coefficients(&modified).unwrap();
+        assert_eq!(coeffs.components.len(), coeffs2.components.len());
+        for (c1, c2) in coeffs.components.iter().zip(coeffs2.components.iter()) {
+            assert_eq!(c1.blocks, c2.blocks);
+        }
     }
 }

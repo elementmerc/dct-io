@@ -60,7 +60,36 @@ let modified = write_coefficients(&jpeg, &coeffs)?;
 std::fs::write("photo_modified.jpg", modified)?;
 ```
 
-### Query block counts without decoding
+### Inspect image metadata cheaply
+
+```rust
+use dct_io::inspect;
+
+let jpeg = std::fs::read("photo.jpg")?;
+let info = inspect(&jpeg)?;
+println!("{}×{}, {} components", info.width, info.height, info.components.len());
+for comp in &info.components {
+    println!("  id={} h={} v={} blocks={}", comp.id, comp.h_samp, comp.v_samp, comp.block_count);
+}
+```
+
+### Count eligible AC positions for steganography
+
+```rust
+use dct_io::{read_coefficients, eligible_ac_count};
+
+let jpeg = std::fs::read("photo.jpg")?;
+
+// Cheap path — returns the count directly without allocating coefficient data.
+let n = eligible_ac_count(&jpeg)?;
+println!("{n} positions available for LSB embedding");
+
+// Or after you already have coefficients:
+let coeffs = read_coefficients(&jpeg)?;
+println!("{} positions available", coeffs.eligible_ac_count());
+```
+
+### Query block counts
 
 ```rust
 use dct_io::block_count;
