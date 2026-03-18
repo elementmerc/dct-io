@@ -12,7 +12,7 @@ readme = "README.md"
 rust-version = "1.56"
 
 [dependencies]
-thiserror = "2"
+thiserror = "1"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
