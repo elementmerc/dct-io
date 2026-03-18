@@ -998,7 +998,8 @@ impl<'a> JpegParser<'a> {
 
         if n_mcu > MAX_MCU_COUNT {
             return Err(DctError::Unsupported(format!(
-                "image too large ({} MCUs; max {})", n_mcu, MAX_MCU_COUNT
+                "image too large ({} MCUs; max {})",
+                n_mcu, MAX_MCU_COUNT
             )));
         }
 
@@ -1114,7 +1115,9 @@ impl<'a> JpegParser<'a> {
             if cc.blocks.len() != expected {
                 return Err(DctError::Incompatible(format!(
                     "component {}: expected {} blocks, got {}",
-                    i, expected, cc.blocks.len()
+                    i,
+                    expected,
+                    cc.blocks.len()
                 )));
             }
         }
