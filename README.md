@@ -18,8 +18,31 @@ a list of bass, mid, and treble levels rather than writing out every sound wave.
 is a list of 64 numbers per tile — the **DCT coefficients** — that capture the image's
 frequencies from coarse (the big shapes) to fine (tiny details).
 
+```
+Your photo (e.g. 480×320 pixels)
+┌──────────────────────────────────────┐
+│ ┌──┬──┬──┬──┬──┬──┬──┐              │
+│ │  │  │  │  │  │  │  │  ...         │
+│ ├──┼──┼──┼──┼──┼──┼──┤              │
+│ │  │  │  │  │  │  │  │  ...  each □ │
+│ ├──┼──┼──┼──┼──┼──┼──┤  = 8×8 pixels│
+│ │  │  │  │  │  │  │  │  ...         │
+│ └──┴──┴──┴──┴──┴──┴──┘              │
+│         ... more rows ...            │
+└──────────────────────────────────────┘
+  DCT runs on each tile independently
+```
+
 Those numbers are then rounded (this is the "lossy" part) and packed tightly using
 **Huffman coding** — a compression trick that assigns shorter codes to more common values.
+
+```
+pixels     →   [DCT]   →  coefficients  →  [quantize]  →  integers  →  [Huffman]  →  .jpg
+(8×8 tile)              (64 frequencies)   (round down)   (64 ints)                   file
+                                ▲                              ▲
+                          dct-io reads                  dct-io works
+                          and writes here               with these
+```
 
 This crate peels back those layers. It reads the compressed data, unpacks the Huffman
 codes, and hands you the raw coefficient numbers. You can change them and write a new
@@ -30,6 +53,18 @@ the compression level.
 
 - **Steganography** — hide data inside a JPEG by tweaking the least significant bit of
   coefficients (the JSteg technique). The image looks the same; the bits are yours.
+
+  ```
+  coefficient = 42  →  binary: 0 1 0 1 0 1 [0]
+                                            └── you own this bit
+
+  flip to 1:  42 → 43   (invisible to viewers)
+  flip to 0:  43 → 42   (reversible — read it back later)
+
+  Rule: only use coefficients where |value| ≥ 2 so flipping
+  the LSB never pushes a value through zero (that would change
+  the Huffman encoding and corrupt the file).
+  ```
 - **Watermarking** — embed an invisible signature that survives re-saving.
 - **Forensic analysis** — inspect the raw coefficient structure to detect tampering or
   double compression.
@@ -130,6 +165,31 @@ Each `block: [i16; 64]` is in **JPEG zigzag scan order**:
 
 - **Index 0** — the DC coefficient (represents the average brightness/colour of the tile)
 - **Indices 1–63** — AC coefficients in zigzag order (higher index = higher frequency detail)
+
+```
+8×8 block — coefficient indices in zigzag order
+
+  ◄── low frequency                  high frequency ──►
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │  0 │  1 │  5 │  6 │ 14 │ 15 │ 27 │ 28 │  ▲ low
+  ├────┼────┼────┼────┼────┼────┼────┼────┤  │ freq
+  │  2 │  4 │  7 │ 13 │ 16 │ 26 │ 29 │ 42 │  │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤  │
+  │  3 │  8 │ 12 │ 17 │ 25 │ 30 │ 41 │ 43 │  │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤  │
+  │  9 │ 11 │ 18 │ 24 │ 31 │ 40 │ 44 │ 53 │  ▼
+  ├────┼────┼────┼────┼────┼────┼────┼────┤
+  │ 10 │ 19 │ 23 │ 32 │ 39 │ 45 │ 52 │ 54 │  ▲
+  ├────┼────┼────┼────┼────┼────┼────┼────┤  │
+  │ 20 │ 22 │ 33 │ 38 │ 46 │ 51 │ 55 │ 60 │  │ high
+  ├────┼────┼────┼────┼────┼────┼────┼────┤  │ freq
+  │ 21 │ 34 │ 37 │ 47 │ 50 │ 56 │ 59 │ 61 │  │
+  ├────┼────┼────┼────┼────┼────┼────┼────┤  │
+  │ 35 │ 36 │ 48 │ 49 │ 57 │ 58 │ 62 │ 63 │  ▼
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+    ↑ block[0] = DC (average brightness of this tile)
+    block[1..63] = AC (the detail, from coarse to fine)
+```
 
 The values are the **quantized** coefficients exactly as stored in the file. They have
 *not* been dequantized; multiply by the quantization table if you want the pre-quantized
