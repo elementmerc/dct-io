@@ -11,19 +11,26 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.rust }})
+    name: Test (stable)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, "1.56"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  msrv:
+    name: MSRV (1.56)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: "1.56"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      # Dev-dependencies (image 0.25) require Rust 1.73+, so only check the
+      # library itself — the MSRV guarantee is for library consumers, not tests.
+      - run: cargo check --lib
 
   clippy:
     name: Clippy
