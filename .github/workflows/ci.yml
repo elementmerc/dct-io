@@ -45,8 +45,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # Dev-dependencies (image 0.25) require Rust 1.73+, so only check the
-      # library itself — the MSRV guarantee is for library consumers, not tests.
+      # Cargo resolves dev-dependencies even for `cargo check --lib`, and
+      # image 0.25 requires Rust 1.73+. Strip dev-deps before checking so
+      # the resolver only sees what library consumers actually depend on.
+      - name: Remove dev-dependencies
+        run: |
+          python3 -c "
+          import re, pathlib
+          t = pathlib.Path('Cargo.toml')
+          t.write_text(re.sub(r'\[dev-dependencies\].*', '', t.read_text(), flags=re.DOTALL))
+          "
       - run: cargo check --lib
 
   clippy:
