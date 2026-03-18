@@ -422,7 +422,12 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        BitReader { data, pos: 0, buf: 0, bits: 0 }
+        BitReader {
+            data,
+            pos: 0,
+            buf: 0,
+            bits: 0,
+        }
     }
 
     /// Fill `buf` from the entropy stream, skipping byte stuffing (0xFF 0x00)
@@ -544,7 +549,11 @@ struct BitWriter {
 
 impl BitWriter {
     fn with_capacity(cap: usize) -> Self {
-        BitWriter { out: Vec::with_capacity(cap), buf: 0, bits: 0 }
+        BitWriter {
+            out: Vec::with_capacity(cap),
+            buf: 0,
+            bits: 0,
+        }
     }
 
     /// Write `n` bits of `value` (MSB first).
@@ -689,7 +698,11 @@ impl<'a> JpegParser<'a> {
                 0xC2 => return Err(DctError::Unsupported("progressive JPEG (SOF2)".into())),
                 0xC3 => return Err(DctError::Unsupported("lossless JPEG (SOF3)".into())),
                 0xC9 => return Err(DctError::Unsupported("arithmetic coding (SOF9)".into())),
-                0xCA => return Err(DctError::Unsupported("progressive arithmetic (SOF10)".into())),
+                0xCA => {
+                    return Err(DctError::Unsupported(
+                        "progressive arithmetic (SOF10)".into(),
+                    ))
+                }
                 0xCB => return Err(DctError::Unsupported("lossless arithmetic (SOF11)".into())),
 
                 0xC4 => self.parse_dht()?,
@@ -873,11 +886,13 @@ impl<'a> JpegParser<'a> {
                 .frame_components
                 .iter()
                 .position(|fc| fc.id == comp_id)
-                .ok_or_else(|| {
-                    DctError::Missing(format!("component id {comp_id} in frame"))
-                })?;
+                .ok_or_else(|| DctError::Missing(format!("component id {comp_id} in frame")))?;
 
-            self.scan_components.push(ScanComponent { comp_idx, dc_table, ac_table });
+            self.scan_components.push(ScanComponent {
+                comp_idx,
+                dc_table,
+                ac_table,
+            });
         }
 
         // Skip Ss, Se, Ah/Al (3 bytes).
@@ -913,11 +928,19 @@ impl<'a> JpegParser<'a> {
     // ── MCU geometry helpers ──────────────────────────────────────────────────
 
     fn max_h_samp(&self) -> u8 {
-        self.frame_components.iter().map(|c| c.h_samp).max().unwrap_or(1)
+        self.frame_components
+            .iter()
+            .map(|c| c.h_samp)
+            .max()
+            .unwrap_or(1)
     }
 
     fn max_v_samp(&self) -> u8 {
-        self.frame_components.iter().map(|c| c.v_samp).max().unwrap_or(1)
+        self.frame_components
+            .iter()
+            .map(|c| c.v_samp)
+            .max()
+            .unwrap_or(1)
     }
 
     fn mcu_cols(&self) -> usize {
@@ -1114,8 +1137,7 @@ impl<'a> JpegParser<'a> {
                     .ok_or_else(|| DctError::Missing(format!("AC table {}", sc.ac_table)))?;
 
                 for _du_i in 0..du[sc_idx] {
-                    let block = &coeffs.components[sc.comp_idx].blocks
-                        [comp_block_idx[sc.comp_idx]];
+                    let block = &coeffs.components[sc.comp_idx].blocks[comp_block_idx[sc.comp_idx]];
                     comp_block_idx[sc.comp_idx] += 1;
 
                     // DC coefficient.
@@ -1125,7 +1147,9 @@ impl<'a> JpegParser<'a> {
                     let (dc_cat, dc_bits, dc_n) = encode_value(dc_diff);
                     let (dc_code, dc_code_len) = {
                         let e = dc_table.encode[dc_cat as usize];
-                        if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                        if e.1 == 0 {
+                            return Err(DctError::CorruptEntropy);
+                        }
                         e
                     };
                     writer.write_bits(dc_code, dc_code_len);
@@ -1133,9 +1157,7 @@ impl<'a> JpegParser<'a> {
 
                     // AC coefficients.
                     // Find last non-zero AC position in zigzag order.
-                    let last_nonzero_zz = (1..64)
-                        .rev()
-                        .find(|&i| block[ZIGZAG[i] as usize] != 0);
+                    let last_nonzero_zz = (1..64).rev().find(|&i| block[ZIGZAG[i] as usize] != 0);
 
                     let mut k = 1usize;
                     let mut zero_run = 0usize;
@@ -1149,7 +1171,9 @@ impl<'a> JpegParser<'a> {
                                     // Emit ZRL.
                                     let (zrl_code, zrl_len) = {
                                         let e = ac_table.encode[0xF0];
-                                        if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                                        if e.1 == 0 {
+                                            return Err(DctError::CorruptEntropy);
+                                        }
                                         e
                                     };
                                     writer.write_bits(zrl_code, zrl_len);
@@ -1160,7 +1184,9 @@ impl<'a> JpegParser<'a> {
                                 let rs = ((zero_run as u8) << 4) | cat;
                                 let (ac_code, ac_len) = {
                                     let e = ac_table.encode[rs as usize];
-                                    if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                                    if e.1 == 0 {
+                                        return Err(DctError::CorruptEntropy);
+                                    }
                                     e
                                 };
                                 writer.write_bits(ac_code, ac_len);
@@ -1177,7 +1203,9 @@ impl<'a> JpegParser<'a> {
                     if needs_eob {
                         let (eob_code, eob_len) = {
                             let e = ac_table.encode[0x00];
-                            if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                            if e.1 == 0 {
+                                return Err(DctError::CorruptEntropy);
+                            }
                             e
                         };
                         writer.write_bits(eob_code, eob_len);
@@ -1223,7 +1251,7 @@ mod tests {
     // Build a minimal valid baseline JPEG from raw pixel data using the
     // `image` crate, so our tests do not depend on external fixture files.
     fn make_jpeg_gray(width: u32, height: u32) -> Vec<u8> {
-        use image::{GrayImage, ImageEncoder, codecs::jpeg::JpegEncoder};
+        use image::{codecs::jpeg::JpegEncoder, GrayImage, ImageEncoder};
         let img = GrayImage::from_fn(width, height, |x, y| {
             image::Luma([(((x * 7 + y * 13) % 200) + 28) as u8])
         });
@@ -1235,12 +1263,12 @@ mod tests {
     }
 
     fn make_jpeg_rgb(width: u32, height: u32) -> Vec<u8> {
-        use image::{ImageEncoder, RgbImage, codecs::jpeg::JpegEncoder};
+        use image::{codecs::jpeg::JpegEncoder, ImageEncoder, RgbImage};
         let img = RgbImage::from_fn(width, height, |x, y| {
             image::Rgb([
                 ((x * 11 + y * 3) % 200 + 28) as u8,
-                ((x * 5  + y * 17) % 200 + 28) as u8,
-                ((x * 3  + y * 7)  % 200 + 28) as u8,
+                ((x * 5 + y * 17) % 200 + 28) as u8,
+                ((x * 3 + y * 7) % 200 + 28) as u8,
             ])
         });
         let mut buf = Vec::new();
@@ -1276,9 +1304,11 @@ mod tests {
     fn progressive_jpeg_returns_unsupported() {
         // Craft a minimal JPEG with SOF2 marker.
         let mut data = vec![0xFF, 0xD8]; // SOI
-        // APP0 JFIF (minimal)
+                                         // APP0 JFIF (minimal)
         data.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
-        data.extend_from_slice(&[0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
+        data.extend_from_slice(&[
+            0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        ]);
         // SOF2 marker (progressive)
         data.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x0B]);
         data.extend_from_slice(&[0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00]);
@@ -1339,7 +1369,10 @@ mod tests {
                 }
             }
         }
-        assert!(modified_count > 0, "test image had no eligible coefficients");
+        assert!(
+            modified_count > 0,
+            "test image had no eligible coefficients"
+        );
 
         let modified_jpeg = write_coefficients(&jpeg, &coeffs).unwrap();
 
@@ -1458,7 +1491,9 @@ mod tests {
         let jpeg = make_jpeg_rgb(32, 32);
         let coeffs = read_coefficients(&jpeg).unwrap();
         let eligible = coeffs.eligible_ac_count();
-        let total_ac: usize = coeffs.components.iter()
+        let total_ac: usize = coeffs
+            .components
+            .iter()
             .flat_map(|c| c.blocks.iter())
             .map(|_| 63) // 63 AC coefficients per block
             .sum();
