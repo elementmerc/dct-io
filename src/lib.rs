@@ -54,42 +54,51 @@
 //! std::fs::write("photo_modified.jpg", modified).unwrap();
 //! ```
 
-use thiserror::Error;
-
 // ── Public error type ─────────────────────────────────────────────────────────
 
 /// Errors returned by this crate.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum DctError {
     /// The input does not start with a JPEG SOI marker (`0xFF 0xD8`).
-    #[error("not a JPEG file")]
     NotJpeg,
 
     /// The input was truncated mid-marker or mid-entropy-stream.
-    #[error("truncated JPEG data")]
     Truncated,
 
     /// The entropy-coded data contains an invalid Huffman symbol or an
     /// unexpected structure.
-    #[error("corrupt or malformed JPEG entropy stream")]
     CorruptEntropy,
 
     /// The JPEG uses a feature this crate does not support (e.g. progressive
     /// scan, lossless, or arithmetic coding).
-    #[error("unsupported JPEG variant: {0}")]
     Unsupported(String),
 
     /// A required marker or table is missing from the JPEG (e.g. no SOF, no
     /// SOS, or a scan references a Huffman table that was not defined).
-    #[error("missing required JPEG structure: {0}")]
     Missing(String),
 
     /// The `JpegCoefficients` passed to [`write_coefficients`] is not
     /// compatible with the JPEG (wrong number of components, wrong block
     /// count, wrong component index).
-    #[error("coefficient data is incompatible with this JPEG: {0}")]
     Incompatible(String),
 }
+
+impl core::fmt::Display for DctError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DctError::NotJpeg => f.write_str("not a JPEG file"),
+            DctError::Truncated => f.write_str("truncated JPEG data"),
+            DctError::CorruptEntropy => f.write_str("corrupt or malformed JPEG entropy stream"),
+            DctError::Unsupported(s) => write!(f, "unsupported JPEG variant: {}", s),
+            DctError::Missing(s) => write!(f, "missing required JPEG structure: {}", s),
+            DctError::Incompatible(s) => {
+                write!(f, "coefficient data is incompatible with this JPEG: {}", s)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DctError {}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -756,7 +765,7 @@ impl<'a> JpegParser<'a> {
         self.pos += 1;
 
         if ncomp == 0 || ncomp > 4 {
-            return Err(DctError::Unsupported(format!("{ncomp} components")));
+            return Err(DctError::Unsupported(format!("{} components", ncomp)));
         }
         if self.pos + ncomp * 3 > end {
             return Err(DctError::Truncated);
@@ -886,7 +895,7 @@ impl<'a> JpegParser<'a> {
                 .frame_components
                 .iter()
                 .position(|fc| fc.id == comp_id)
-                .ok_or_else(|| DctError::Missing(format!("component id {comp_id} in frame")))?;
+                .ok_or_else(|| DctError::Missing(format!("component id {} in frame", comp_id)))?;
 
             self.scan_components.push(ScanComponent {
                 comp_idx,
@@ -989,7 +998,8 @@ impl<'a> JpegParser<'a> {
 
         if n_mcu > MAX_MCU_COUNT {
             return Err(DctError::Unsupported(format!(
-                "image too large ({n_mcu} MCUs; max {MAX_MCU_COUNT})"
+                "image too large ({} MCUs; max {})",
+                n_mcu, MAX_MCU_COUNT
             )));
         }
 
@@ -1098,13 +1108,15 @@ impl<'a> JpegParser<'a> {
         for (i, (cc, &expected)) in coeffs.components.iter().zip(counts.iter()).enumerate() {
             if cc.id != self.frame_components[i].id {
                 return Err(DctError::Incompatible(format!(
-                    "component {i}: expected id {}, got {}",
-                    self.frame_components[i].id, cc.id
+                    "component {}: expected id {}, got {}",
+                    i, self.frame_components[i].id, cc.id
                 )));
             }
             if cc.blocks.len() != expected {
                 return Err(DctError::Incompatible(format!(
-                    "component {i}: expected {expected} blocks, got {}",
+                    "component {}: expected {} blocks, got {}",
+                    i,
+                    expected,
                     cc.blocks.len()
                 )));
             }
