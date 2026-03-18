@@ -6,12 +6,13 @@ description = "Read and write quantized DCT coefficients in baseline JPEG files"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/elementmerc/dct-io"
 documentation = "https://docs.rs/dct-io"
-keywords = ["jpeg", "dct", "image", "codec"]
+keywords = ["jpeg", "dct", "image", "steganography", "codec"]
 categories = ["multimedia::images", "encoding", "parser-implementations"]
 readme = "README.md"
+rust-version = "1.56"
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

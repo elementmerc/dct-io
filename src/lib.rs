@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Read and write quantized DCT coefficients in baseline JPEG files.
 //!
 //! This crate provides direct access to the quantized DCT coefficients stored
@@ -53,8 +54,6 @@
 //! std::fs::write("photo_modified.jpg", modified).unwrap();
 //! ```
 
-use std::collections::HashMap;
-
 use thiserror::Error;
 
 // ── Public error type ─────────────────────────────────────────────────────────
@@ -72,7 +71,7 @@ pub enum DctError {
 
     /// The entropy-coded data contains an invalid Huffman symbol or an
     /// unexpected structure.
-    #[error("corrupt entropy stream")]
+    #[error("corrupt or malformed JPEG entropy stream")]
     CorruptEntropy,
 
     /// The JPEG uses a feature this crate does not support (e.g. progressive
@@ -161,6 +160,7 @@ pub struct JpegCoefficients {
 ///
 /// Returns [`DctError`] if the input is not a supported baseline JPEG, if
 /// required markers are missing, or if the entropy stream is corrupt.
+#[must_use = "returns the decoded coefficients or an error; ignoring it discards the result"]
 pub fn read_coefficients(jpeg: &[u8]) -> Result<JpegCoefficients, DctError> {
     let mut parser = JpegParser::new(jpeg)?;
     parser.parse()?;
@@ -177,11 +177,21 @@ pub fn read_coefficients(jpeg: &[u8]) -> Result<JpegCoefficients, DctError> {
 /// The output is a valid JPEG. All non-entropy-coded segments (EXIF, ICC
 /// profile, quantization tables, etc.) are preserved verbatim.
 ///
+/// # Safety note
+///
+/// The output is only as valid as the input JPEG's Huffman tables permit.
+/// If you set a coefficient to a value whose (run, category) symbol does not
+/// exist in the original Huffman table, encoding will return
+/// [`DctError::CorruptEntropy`]. Stick to modifying the LSB of coefficients
+/// with `|v| >= 2` (JSteg-style) to stay safely within the table.
+///
 /// # Errors
 ///
 /// Returns [`DctError::Incompatible`] if `coeffs` has a different number of
-/// components or blocks than the original JPEG.
+/// components, a different block count, or mismatched component IDs compared
+/// to the original JPEG.
 /// Returns [`DctError`] for any parse or encoding failure.
+#[must_use = "returns the re-encoded JPEG bytes or an error; ignoring it discards the result"]
 pub fn write_coefficients(jpeg: &[u8], coeffs: &JpegCoefficients) -> Result<Vec<u8>, DctError> {
     let mut parser = JpegParser::new(jpeg)?;
     parser.parse()?;
@@ -197,10 +207,11 @@ pub fn write_coefficients(jpeg: &[u8], coeffs: &JpegCoefficients) -> Result<Vec<
 /// # Errors
 ///
 /// Returns [`DctError`] if the input is not a supported baseline JPEG.
+#[must_use = "returns block counts or an error; ignoring it discards the result"]
 pub fn block_count(jpeg: &[u8]) -> Result<Vec<usize>, DctError> {
     let mut parser = JpegParser::new(jpeg)?;
     parser.parse()?;
-    Ok(parser.block_counts())
+    parser.block_counts()
 }
 
 /// Inspect a JPEG and return image metadata without decoding the entropy stream.
@@ -211,10 +222,11 @@ pub fn block_count(jpeg: &[u8]) -> Result<Vec<usize>, DctError> {
 /// # Errors
 ///
 /// Returns [`DctError`] if the input is not a supported baseline JPEG.
+#[must_use = "returns image metadata or an error; ignoring it discards the result"]
 pub fn inspect(jpeg: &[u8]) -> Result<JpegInfo, DctError> {
     let mut parser = JpegParser::new(jpeg)?;
     parser.parse()?;
-    let counts = parser.block_counts();
+    let counts = parser.block_counts()?;
     Ok(JpegInfo {
         width: parser.image_width,
         height: parser.image_height,
@@ -242,6 +254,7 @@ pub fn inspect(jpeg: &[u8]) -> Result<JpegInfo, DctError> {
 /// # Errors
 ///
 /// Returns [`DctError`] if the input is not a supported baseline JPEG.
+#[must_use = "returns the eligible AC coefficient count or an error; ignoring it discards the result"]
 pub fn eligible_ac_count(jpeg: &[u8]) -> Result<usize, DctError> {
     Ok(read_coefficients(jpeg)?.eligible_ac_count())
 }
@@ -263,6 +276,7 @@ impl JpegCoefficients {
     /// let coeffs = read_coefficients(&jpeg).unwrap();
     /// println!("Eligible AC positions: {}", coeffs.eligible_ac_count());
     /// ```
+    #[must_use]
     pub fn eligible_ac_count(&self) -> usize {
         self.components
             .iter()
@@ -332,19 +346,23 @@ fn encode_value(value: i16) -> (u8, u16, u8) {
 /// Decoding uses a flat 65 536-entry lookup table indexed by the top 16 bits
 /// of the bit-stream. Each entry packs `(symbol << 8) | code_len` as a `u16`,
 /// with 0 meaning "no code with this prefix". This gives O(1) decode with no
-/// hash collision and better cache locality than the HashMap approach.
+/// branch on the hot path.
+///
+/// Encoding uses a flat 256-entry array keyed by symbol (u8). Each entry is
+/// `(code, code_length)`; a length of 0 means the symbol is not in this table.
 #[derive(Clone)]
 struct HuffTable {
     /// 16-bit LUT: index = top 16 stream bits → `(symbol << 8) | len`, 0 = invalid.
     lut: Vec<u16>,
-    /// Encode map: `symbol → (code, code_length)`.
-    encode: HashMap<u8, (u16, u8)>,
+    /// Encode table: `encode[symbol] = (code, code_length)`, len 0 = absent.
+    encode: [(u16, u8); 256],
 }
 
 impl std::fmt::Debug for HuffTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries = self.encode.iter().filter(|e| e.1 > 0).count();
         f.debug_struct("HuffTable")
-            .field("encode_entries", &self.encode.len())
+            .field("encode_entries", &entries)
             .finish()
     }
 }
@@ -355,7 +373,7 @@ impl HuffTable {
     /// `counts` is the 16-byte array of code counts per length (1..=16).
     /// `symbols` is the flat list of symbols in canonical order.
     fn from_jpeg(counts: &[u8; 16], symbols: &[u8]) -> Result<Self, DctError> {
-        let mut encode = HashMap::new();
+        let mut encode = [(0u16, 0u8); 256];
         let mut lut = vec![0u16; 65536];
         let mut code: u16 = 0;
         let mut sym_idx = 0usize;
@@ -366,9 +384,15 @@ impl HuffTable {
                 if sym_idx >= symbols.len() {
                     return Err(DctError::CorruptEntropy);
                 }
+                // Guard against a malformed DHT where the canonical code would
+                // overflow 16 bits or index outside our LUT. Use u32 for the
+                // shift so `len == 16` does not itself overflow.
+                if (code as u32) >= (1u32 << len) {
+                    return Err(DctError::CorruptEntropy);
+                }
                 let sym = symbols[sym_idx];
                 sym_idx += 1;
-                encode.insert(sym, (code, len));
+                encode[sym as usize] = (code, len);
 
                 // Fill all 16-bit keys whose top `len` bits equal `code`.
                 // Each such key represents a stream where the Huffman prefix
@@ -498,24 +522,13 @@ impl<'a> BitReader<'a> {
         // Discard any remaining bits in the current byte.
         self.bits = 0;
         self.buf = 0;
-        // Skip 0xFF padding bytes then check for RST0–RST7 (0xD0–0xD7).
-        while self.pos < self.data.len() {
-            let b = self.data[self.pos];
-            if b != 0xFF {
-                break;
-            }
-            self.pos += 1;
-            if self.pos >= self.data.len() {
-                break;
-            }
-            let marker_id = self.data[self.pos];
-            if (0xD0..=0xD7).contains(&marker_id) {
-                self.pos += 1;
-                return true;
-            }
-            // Not a RST marker — back up and stop.
-            self.pos -= 1;
-            break;
+        // Check for a single 0xFF followed by RST0–RST7 (0xD0–0xD7).
+        if self.pos + 1 < self.data.len()
+            && self.data[self.pos] == 0xFF
+            && (0xD0..=0xD7).contains(&self.data[self.pos + 1])
+        {
+            self.pos += 2;
+            return true;
         }
         false
     }
@@ -530,8 +543,8 @@ struct BitWriter {
 }
 
 impl BitWriter {
-    fn new() -> Self {
-        BitWriter { out: Vec::new(), buf: 0, bits: 0 }
+    fn with_capacity(cap: usize) -> Self {
+        BitWriter { out: Vec::with_capacity(cap), buf: 0, bits: 0 }
     }
 
     /// Write `n` bits of `value` (MSB first).
@@ -721,6 +734,11 @@ impl<'a> JpegParser<'a> {
         self.pos += 2;
         self.image_width = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
+
+        if self.image_width == 0 || self.image_height == 0 {
+            return Err(DctError::Unsupported("zero image dimension".into()));
+        }
+
         let ncomp = self.data[self.pos] as usize;
         self.pos += 1;
 
@@ -737,10 +755,15 @@ impl<'a> JpegParser<'a> {
             let samp = self.data[self.pos + 1];
             let qt_id = self.data[self.pos + 2];
             self.pos += 3;
+            let h_samp = samp >> 4;
+            let v_samp = samp & 0x0F;
+            if h_samp == 0 || v_samp == 0 {
+                return Err(DctError::CorruptEntropy);
+            }
             self.frame_components.push(FrameComponent {
                 id,
-                h_samp: samp >> 4,
-                v_samp: samp & 0x0F,
+                h_samp,
+                v_samp,
                 qt_id,
             });
         }
@@ -767,6 +790,9 @@ impl<'a> JpegParser<'a> {
             let tc = (tc_th >> 4) & 0x0F; // 0=DC, 1=AC
             let th = (tc_th & 0x0F) as usize; // table index 0–3
 
+            if tc > 1 {
+                return Err(DctError::CorruptEntropy);
+            }
             if th > 3 {
                 return Err(DctError::CorruptEntropy);
             }
@@ -779,6 +805,10 @@ impl<'a> JpegParser<'a> {
             self.pos += 16;
 
             let total: usize = counts.iter().map(|&c| c as usize).sum();
+            // JPEG Huffman symbols are u8, so at most 256 unique symbols per table.
+            if total > 256 {
+                return Err(DctError::CorruptEntropy);
+            }
             if self.pos + total > end {
                 return Err(DctError::Truncated);
             }
@@ -819,6 +849,9 @@ impl<'a> JpegParser<'a> {
         let ns = self.data[self.pos] as usize;
         self.pos += 1;
 
+        if ns == 0 || ns > self.frame_components.len() {
+            return Err(DctError::CorruptEntropy);
+        }
         if self.pos + ns * 2 > end {
             return Err(DctError::Truncated);
         }
@@ -831,6 +864,10 @@ impl<'a> JpegParser<'a> {
 
             let dc_table = (td_ta >> 4) as usize;
             let ac_table = (td_ta & 0x0F) as usize;
+
+            if dc_table > 3 || ac_table > 3 {
+                return Err(DctError::CorruptEntropy);
+            }
 
             let comp_idx = self
                 .frame_components
@@ -893,8 +930,10 @@ impl<'a> JpegParser<'a> {
         (self.image_height as usize + max_v * 8 - 1) / (max_v * 8)
     }
 
-    fn mcu_count(&self) -> usize {
-        self.mcu_cols() * self.mcu_rows()
+    fn mcu_count(&self) -> Result<usize, DctError> {
+        self.mcu_cols()
+            .checked_mul(self.mcu_rows())
+            .ok_or_else(|| DctError::Unsupported("image dimensions overflow usize".into()))
     }
 
     /// Number of 8×8 data units per MCU for each scan component.
@@ -909,21 +948,21 @@ impl<'a> JpegParser<'a> {
     }
 
     /// Total block count per frame component (after all scan components resolved).
-    fn block_counts(&self) -> Vec<usize> {
-        let n_mcu = self.mcu_count();
+    fn block_counts(&self) -> Result<Vec<usize>, DctError> {
+        let n_mcu = self.mcu_count()?;
         let du = self.du_per_mcu();
         let mut counts = vec![0usize; self.frame_components.len()];
         for (sc_idx, sc) in self.scan_components.iter().enumerate() {
             counts[sc.comp_idx] = n_mcu * du[sc_idx];
         }
-        counts
+        Ok(counts)
     }
 
     // ── Decode ────────────────────────────────────────────────────────────────
 
     fn decode_coefficients(&self) -> Result<JpegCoefficients, DctError> {
         let entropy = &self.data[self.entropy_start..self.entropy_start + self.entropy_len];
-        let n_mcu = self.mcu_count();
+        let n_mcu = self.mcu_count()?;
 
         if n_mcu > MAX_MCU_COUNT {
             return Err(DctError::Unsupported(format!(
@@ -934,7 +973,7 @@ impl<'a> JpegParser<'a> {
         let du = self.du_per_mcu();
 
         // Pre-allocate output vectors.
-        let counts = self.block_counts();
+        let counts = self.block_counts()?;
         let mut comp_blocks: Vec<Vec<[i16; 64]>> =
             counts.iter().map(|&c| vec![[0i16; 64]; c]).collect();
         let mut comp_block_idx: Vec<usize> = vec![0; self.frame_components.len()];
@@ -998,9 +1037,10 @@ impl<'a> JpegParser<'a> {
                     }
 
                     let block_idx = comp_block_idx[sc.comp_idx];
-                    if block_idx < comp_blocks[sc.comp_idx].len() {
-                        comp_blocks[sc.comp_idx][block_idx] = block;
+                    if block_idx >= comp_blocks[sc.comp_idx].len() {
+                        return Err(DctError::CorruptEntropy);
                     }
+                    comp_blocks[sc.comp_idx][block_idx] = block;
                     comp_block_idx[sc.comp_idx] += 1;
                 }
             }
@@ -1009,11 +1049,8 @@ impl<'a> JpegParser<'a> {
         let components = self
             .frame_components
             .iter()
-            .enumerate()
-            .map(|(i, fc)| ComponentCoefficients {
-                id: fc.id,
-                blocks: comp_blocks[i].clone(),
-            })
+            .zip(comp_blocks)
+            .map(|(fc, blocks)| ComponentCoefficients { id: fc.id, blocks })
             .collect();
 
         Ok(JpegCoefficients { components })
@@ -1034,8 +1071,14 @@ impl<'a> JpegParser<'a> {
                 coeffs.components.len()
             )));
         }
-        let counts = self.block_counts();
+        let counts = self.block_counts()?;
         for (i, (cc, &expected)) in coeffs.components.iter().zip(counts.iter()).enumerate() {
+            if cc.id != self.frame_components[i].id {
+                return Err(DctError::Incompatible(format!(
+                    "component {i}: expected id {}, got {}",
+                    self.frame_components[i].id, cc.id
+                )));
+            }
             if cc.blocks.len() != expected {
                 return Err(DctError::Incompatible(format!(
                     "component {i}: expected {expected} blocks, got {}",
@@ -1044,10 +1087,10 @@ impl<'a> JpegParser<'a> {
             }
         }
 
-        let n_mcu = self.mcu_count();
+        let n_mcu = self.mcu_count()?;
         let du = self.du_per_mcu();
 
-        let mut writer = BitWriter::new();
+        let mut writer = BitWriter::with_capacity(self.entropy_len);
         let mut dc_pred: Vec<i16> = vec![0; self.scan_components.len()];
         let mut comp_block_idx: Vec<usize> = vec![0; self.frame_components.len()];
         let restart_interval = self.restart_interval as usize;
@@ -1080,11 +1123,11 @@ impl<'a> JpegParser<'a> {
                     let dc_diff = dc_val.saturating_sub(dc_pred[sc_idx]);
                     dc_pred[sc_idx] = dc_val;
                     let (dc_cat, dc_bits, dc_n) = encode_value(dc_diff);
-                    let (dc_code, dc_code_len) = dc_table
-                        .encode
-                        .get(&dc_cat)
-                        .copied()
-                        .ok_or(DctError::CorruptEntropy)?;
+                    let (dc_code, dc_code_len) = {
+                        let e = dc_table.encode[dc_cat as usize];
+                        if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                        e
+                    };
                     writer.write_bits(dc_code, dc_code_len);
                     writer.write_bits(dc_bits, dc_n);
 
@@ -1104,22 +1147,22 @@ impl<'a> JpegParser<'a> {
                                 zero_run += 1;
                                 if zero_run == 16 {
                                     // Emit ZRL.
-                                    let (zrl_code, zrl_len) = ac_table
-                                        .encode
-                                        .get(&0xF0)
-                                        .copied()
-                                        .ok_or(DctError::CorruptEntropy)?;
+                                    let (zrl_code, zrl_len) = {
+                                        let e = ac_table.encode[0xF0];
+                                        if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                                        e
+                                    };
                                     writer.write_bits(zrl_code, zrl_len);
                                     zero_run = 0;
                                 }
                             } else {
                                 let (cat, bits, n) = encode_value(val);
                                 let rs = ((zero_run as u8) << 4) | cat;
-                                let (ac_code, ac_len) = ac_table
-                                    .encode
-                                    .get(&rs)
-                                    .copied()
-                                    .ok_or(DctError::CorruptEntropy)?;
+                                let (ac_code, ac_len) = {
+                                    let e = ac_table.encode[rs as usize];
+                                    if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                                    e
+                                };
                                 writer.write_bits(ac_code, ac_len);
                                 writer.write_bits(bits, n);
                                 zero_run = 0;
@@ -1132,11 +1175,11 @@ impl<'a> JpegParser<'a> {
                     // EOB is unnecessary (libjpeg/libjpeg-turbo behaviour).
                     let needs_eob = last_nonzero_zz.map_or(true, |p| p < 63);
                     if needs_eob {
-                        let (eob_code, eob_len) = ac_table
-                            .encode
-                            .get(&0x00)
-                            .copied()
-                            .ok_or(DctError::CorruptEntropy)?;
+                        let (eob_code, eob_len) = {
+                            let e = ac_table.encode[0x00];
+                            if e.1 == 0 { return Err(DctError::CorruptEntropy); }
+                            e
+                        };
                         writer.write_bits(eob_code, eob_len);
                     }
                 }
