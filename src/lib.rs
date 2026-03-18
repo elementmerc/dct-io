@@ -54,42 +54,51 @@
 //! std::fs::write("photo_modified.jpg", modified).unwrap();
 //! ```
 
-use thiserror::Error;
-
 // ── Public error type ─────────────────────────────────────────────────────────
 
 /// Errors returned by this crate.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum DctError {
     /// The input does not start with a JPEG SOI marker (`0xFF 0xD8`).
-    #[error("not a JPEG file")]
     NotJpeg,
 
     /// The input was truncated mid-marker or mid-entropy-stream.
-    #[error("truncated JPEG data")]
     Truncated,
 
     /// The entropy-coded data contains an invalid Huffman symbol or an
     /// unexpected structure.
-    #[error("corrupt or malformed JPEG entropy stream")]
     CorruptEntropy,
 
     /// The JPEG uses a feature this crate does not support (e.g. progressive
     /// scan, lossless, or arithmetic coding).
-    #[error("unsupported JPEG variant: {0}")]
     Unsupported(String),
 
     /// A required marker or table is missing from the JPEG (e.g. no SOF, no
     /// SOS, or a scan references a Huffman table that was not defined).
-    #[error("missing required JPEG structure: {0}")]
     Missing(String),
 
     /// The `JpegCoefficients` passed to [`write_coefficients`] is not
     /// compatible with the JPEG (wrong number of components, wrong block
     /// count, wrong component index).
-    #[error("coefficient data is incompatible with this JPEG: {0}")]
     Incompatible(String),
 }
+
+impl core::fmt::Display for DctError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DctError::NotJpeg => f.write_str("not a JPEG file"),
+            DctError::Truncated => f.write_str("truncated JPEG data"),
+            DctError::CorruptEntropy => f.write_str("corrupt or malformed JPEG entropy stream"),
+            DctError::Unsupported(s) => write!(f, "unsupported JPEG variant: {}", s),
+            DctError::Missing(s) => write!(f, "missing required JPEG structure: {}", s),
+            DctError::Incompatible(s) => {
+                write!(f, "coefficient data is incompatible with this JPEG: {}", s)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DctError {}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
